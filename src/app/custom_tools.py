@@ -1,59 +1,131 @@
-"""Tasks 7 and 8: four tools. Names, arguments, outputs, errors, metric and log names are FIXED (the autograder checks them).
+"""Tasks 7 and 8: kb_stats, document_outline, delete_document, update_document (all async, all per user)."""
+import asyncio
+import time
 
-The heavy parts are PROVIDED (kb/store.py: stats / outline / delete_document, kb/pipeline.py: ingest_file).
-You write the tool wrappers: signature + docstring (the docstring is the prompt: say WHEN to use it, describe each argument),
-validation, ToolException with `ERROR[CODE]: what happened. Next step: what to do.`, the metric, the log line, `handle_tool_error = True`.
-All four are `async def` (blocking calls go through asyncio.to_thread). They act on the CALLING USER's knowledge base:
-`runtime.context.user_id` (task 6), never on another user's. build_custom_tools(kb) returns all four.
-Look at kb/tools.py for the pattern (ToolRuntime, ToolException, handle_tool_error).
+from langchain.tools import ToolRuntime
+from langchain_core.tools import ToolException, tool
+from opentelemetry import metrics
 
----------------------------------------------------------------------------------- task 7.1  kb_stats(top_keywords: int = 5) -> str
-  output  "<D> documents, <S> sections, <C> chunks. Top keywords: k1, k2, ..."   from kb.stats(user_id); at most `top_keywords` keywords
-          empty knowledge base: "The knowledge base is empty."
-  error   top_keywords outside 1..20  ->  ERROR[INVALID_INPUT]
-
----------------------------------------------------------------------------------- task 7.2  document_outline(doc_name: str) -> str
-  The structure of one document: use it when the user asks what a document contains, how it is organised, or which section covers
-  something (then search that section). Resolve doc_name with kb.resolve_doc_name(user_id, doc_name), find the doc_id in
-  kb.documents(user_id), read the sections with kb.outline(user_id, doc_id).
-  output  first line   "Outline of '<exact file name>' (<N> sections):"          (always the word "sections")
-          then one line per section, in reading order, 1-based position:
-              "<i>. [L<level>] <heading> (p.<a>-<b>): <summary>"
-          the page part is " (p.<a>-<b>)" when page_start != page_end, " (p.<a>)" when they are equal, and left out when the
-          document has no pages (page_start is None); then ": <summary>"
-  error   no such document in THIS user's knowledge base  ->  ERROR[UNKNOWN_DOCUMENT]  (list the valid names in the message)
-
----------------------------------------------------------------------------------- task 7.3  observability, every call, ok AND error
-  metric  kb_stats: counter "kbstats.calls"    document_outline: counter "outline.calls"
-          record with attributes {"status": "ok" | "error"}  (Prometheus: agent_outline_calls_total, ...)
-          metrics.get_meter("agent").create_counter(...)   (see how app/telemetry.py creates TOOL_CALLS)
-  log     log.info("kb_stats_done", tool="kb_stats", status=..., duration_ms=<int>)
-          log.info("document_outline_done", tool="document_outline", status=..., duration_ms=<int>, sections=<int, 0 on error>)
-          (`from app.telemetry import log`; never log document text)
-  Grafana (recommended, not graded): src/app/dashboards/outline.json with a panel for outline.calls by status and a logs panel
-          ({service_name="extraction-agent"} | json | event="document_outline_done").
-
----------------------------------------------------------------------------------- task 8.1  delete_document(doc_name: str) -> str
-  Removes one document from the user's knowledge base. doc_name is a file name from the KNOWLEDGE BASE list.
-  Resolve it with kb.resolve_doc_name(user_id, doc_name); find the document's doc_id in kb.documents(user_id);
-  delete with kb.delete_document(user_id, doc_id).
-  output  "Deleted '<exact file name>'. <N> documents left."
-  error   no such document in THIS user's knowledge base  ->  ERROR[UNKNOWN_DOCUMENT]  (list the valid names in the message)
-
----------------------------------------------------------------------------------- task 8.2  update_document(doc_name: str, source: str) -> str
-  Replaces a document with a new version the user uploaded. source = the file_id of the NEW upload (like ingest_document).
-  Order matters: ingest the new file FIRST under the OLD file name (kb/pipeline.ingest_file, files.resolve), and only when that
-  succeeded delete the old version by its doc_id: a failed update must leave the old document untouched.
-  If the new file is identical to a document already in the knowledge base ingest_file returns it as `existing`: change nothing.
-  output  "Updated '<exact file name>': <S> sections, <C> chunks."      identical content: "'<name>' is already up to date."
-  errors  unknown doc_name -> ERROR[UNKNOWN_DOCUMENT];  bad/unknown file_id -> use app.errors.to_tool_exception on the DocError
-          (it yields ERROR[FILE_NOT_FOUND]).
-"""
-from langchain_core.tools import tool  # noqa: F401  (you will need it)
-
+from app.context import Ctx
+from app.errors import to_tool_exception
+from app.kb import files
+from app.kb.pipeline import ingest_file
 from app.kb.store import KnowledgeBase
+from app.telemetry import log
+
+_meter = metrics.get_meter("agent")
+KBSTATS_CALLS = _meter.create_counter("kbstats.calls", unit="1", description="kb_stats calls")
+OUTLINE_CALLS = _meter.create_counter("outline.calls", unit="1", description="document_outline calls")
+
+
+def _unknown_document(doc_name: str, docs: list[dict]) -> ToolException:
+    names = ", ".join(f'"{d["filename"]}"' for d in docs) or "(none)"
+    return ToolException(f"ERROR[UNKNOWN_DOCUMENT]: No document matches '{doc_name}' in your knowledge base. Documents: {names}. "
+                         "Next step: retry with one of these names.")
+
+
+async def _find(kb: KnowledgeBase, user_id: str, doc_name: str) -> tuple[str, dict]:
+    """doc_name -> (exact file name, document row) in THIS user's knowledge base, or ERROR[UNKNOWN_DOCUMENT]."""
+    exact = await asyncio.to_thread(kb.resolve_doc_name, user_id, doc_name)
+    docs = await asyncio.to_thread(kb.documents, user_id)
+    doc = next((d for d in docs if d["filename"] == exact), None) if exact else None
+    if doc is None:
+        raise _unknown_document(doc_name, docs)
+    return exact, doc
 
 
 def build_custom_tools(kb: KnowledgeBase) -> list:
-    # TODO(tasks 7 and 8): define kb_stats, document_outline, delete_document and update_document here and return all four
-    return []
+    @tool
+    async def kb_stats(runtime: ToolRuntime[Ctx], top_keywords: int = 5) -> str:
+        """Overall numbers about the user's knowledge base: how many documents, sections and chunks it holds, and its most
+        common keywords. Use it when the user asks how big the knowledge base is, what it covers overall or what the main topics are.
+
+        Args:
+            top_keywords: how many top keywords to list (1 to 20, default 5)
+        """
+        t0, status = time.perf_counter(), "error"
+        try:
+            if not 1 <= top_keywords <= 20:
+                raise ToolException("ERROR[INVALID_INPUT]: top_keywords must be between 1 and 20. Next step: retry with a number from 1 to 20.")
+            stats = await asyncio.to_thread(kb.stats, runtime.context.user_id)
+            status = "ok"
+            if not stats["documents"]:
+                return "The knowledge base is empty."
+            return (f"{stats['documents']} documents, {stats['sections']} sections, {stats['chunks']} chunks. "
+                    f"Top keywords: {', '.join(stats['keywords'][:top_keywords])}")
+        finally:
+            KBSTATS_CALLS.add(1, {"status": status})
+            log.info("kb_stats_done", tool="kb_stats", status=status, duration_ms=int((time.perf_counter() - t0) * 1000))
+
+    @tool
+    async def document_outline(doc_name: str, runtime: ToolRuntime[Ctx]) -> str:
+        """The structure of ONE document in the user's knowledge base: its sections in reading order with level, pages and a
+        summary. Use it when the user asks what a document contains, how it is organised, or which section covers something
+        (then search that section).
+
+        Args:
+            doc_name: file name from the KNOWLEDGE BASE list
+        """
+        t0, status, n_sections = time.perf_counter(), "error", 0
+        try:
+            user_id = runtime.context.user_id
+            exact, doc = await _find(kb, user_id, doc_name)
+            sections = await asyncio.to_thread(kb.outline, user_id, doc["doc_id"])
+            lines = [f"Outline of '{exact}' ({len(sections)} sections):"]
+            for i, s in enumerate(sections, start=1):
+                if s["page_start"] is None:
+                    pages = ""
+                elif s["page_start"] != s["page_end"]:
+                    pages = f" (p.{s['page_start']}-{s['page_end']})"
+                else:
+                    pages = f" (p.{s['page_start']})"
+                lines.append(f"{i}. [L{s['level']}] {s['heading']}{pages}: {s['summary']}")
+            n_sections, status = len(sections), "ok"
+            return "\n".join(lines)
+        finally:
+            OUTLINE_CALLS.add(1, {"status": status})
+            log.info("document_outline_done", tool="document_outline", status=status,
+                     duration_ms=int((time.perf_counter() - t0) * 1000), sections=n_sections)
+
+    @tool
+    async def delete_document(doc_name: str, runtime: ToolRuntime[Ctx]) -> str:
+        """Remove ONE document from the user's knowledge base, so it is no longer searched or listed. Use it when the user asks
+        to delete, remove or forget a document.
+
+        Args:
+            doc_name: file name from the KNOWLEDGE BASE list
+        """
+        user_id = runtime.context.user_id
+        exact, doc = await _find(kb, user_id, doc_name)
+        try:
+            await asyncio.to_thread(kb.delete_document, user_id, doc["doc_id"])
+            left = len(await asyncio.to_thread(kb.documents, user_id))
+        except Exception as exc:
+            raise to_tool_exception(exc) from exc
+        return f"Deleted '{exact}'. {left} documents left."
+
+    @tool
+    async def update_document(doc_name: str, source: str, runtime: ToolRuntime[Ctx]) -> str:
+        """Replace a document in the user's knowledge base with a newly uploaded version under the same name. Use it when the
+        user uploads a new version of a document that is already in the knowledge base.
+
+        Args:
+            doc_name: file name of the existing document, from the KNOWLEDGE BASE list
+            source: the file_id of the NEW upload (from the upload message)
+        """
+        user_id = runtime.context.user_id
+        exact, old = await _find(kb, user_id, doc_name)
+        try:
+            path, _ = files.resolve(runtime.context.session_id, source.strip())
+            result, existing = await ingest_file(kb, user_id, path, exact, runtime.config)  # new version first ...
+            if existing:
+                return f"'{exact}' is already up to date."
+            await asyncio.to_thread(kb.delete_document, user_id, old["doc_id"])  # ... the old one only after it worked
+        except Exception as exc:
+            raise to_tool_exception(exc) from exc
+        return f"Updated '{exact}': {len(result.sections)} sections, {result.n_chunks} chunks."
+
+    tools = [kb_stats, document_outline, delete_document, update_document]
+    for t in tools:
+        t.handle_tool_error = True
+    return tools
