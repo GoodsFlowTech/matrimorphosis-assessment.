@@ -19,4 +19,4 @@ async def open_checkpointer():
 
 @asynccontextmanager
 async def open_checkpointer():
-    yield InMemorySaver()  # TODO(task 3): replace with an AsyncSqliteSaver on CHECKPOINT_DB
+    yield InMemorySaver()  # TODO(task 3): replace with an AsyncSqliteSaver on CHECKPOINT_DB 
