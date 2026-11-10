@@ -6,7 +6,6 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, dynamic_prompt
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.checkpoint.memory import InMemorySaver
 
 from app.context import Ctx
 from app.custom_tools import build_custom_tools
@@ -65,13 +64,21 @@ async def mcp_tools():
     """MCP tools become ordinary LangChain tools. The notes and tasks server (src/app/mcp_server/server.py) is reached over HTTP at
     MCP_URL (docker compose and CI start it). Retries a few times: the server may still be starting.
 
-    TODO(task 9): make every MCP call run AS THE LOGGED-IN USER. The server reads `Authorization: Bearer <token>`. Write a tool
+    DONE (task 9): every MCP call now runs run AS THE LOGGED-IN USER. The server reads `Authorization: Bearer <token>`. Write a tool
     interceptor (langchain-mcp-adapters: `async def interceptor(request, handler)`; `request.runtime.context` is this request's Ctx,
     `request.override(headers={...})` returns a request with extra HTTP headers) and pass it as tool_interceptors=[...] below.
     The token comes from Ctx (task 9: add `token` to Ctx, /agent fills it from the Authorization header). The model never sees it.
     """
     url = os.getenv("MCP_URL", "http://localhost:9000/mcp")
-    client = MultiServerMCPClient({"tasks": {"url": url, "transport": "streamable_http"}})  # TODO(task 9): tool_interceptors=[...]
+
+    async def forward_token(request, handler):
+        """Every MCP call runs as the logged-in user: the token comes from the request Ctx, never from the model."""
+        token = getattr(request.runtime.context, "token", "")
+        if token:
+            request = request.override(headers={**(request.headers or {}), "Authorization": f"Bearer {token}"})
+        return await handler(request)
+
+    client = MultiServerMCPClient({"tasks": {"url": url, "transport": "streamable_http"}}, tool_interceptors=[forward_token])
     for attempt in range(15):
         try:
             return await client.get_tools()
@@ -82,7 +89,7 @@ async def mcp_tools():
 
 
 async def build_agent(kb: KnowledgeBase, model=agent_llm, checkpointer=None):
-    """TODO(task 1): define the agent. main.py calls `agent, tools = await build_agent(kb, checkpointer=checkpointer)`.
+    """Task 1: the agent. main.py calls `agent, tools = await build_agent(kb, checkpointer=checkpointer)`.
 
     What is here is a bare agent: Session 1 tools only, one fixed prompt, no memory. Build the real one, in this order:
 
@@ -99,8 +106,20 @@ async def build_agent(kb: KnowledgeBase, model=agent_llm, checkpointer=None):
       5. MEMORY: checkpointer=checkpointer (task 3), so each thread_id keeps its own conversation
       6. return `agent, tools`   (the TOOL OBJECTS; main.py builds /health and /debug/tools from them)
     """
-    tools = [*S1_TOOLS]  # TODO(task 1.1)
-    agent = create_agent(model=model, tools=tools, system_prompt=SYSTEM_PROMPT)  # TODO(task 1.2 - 1.5)
+    tools = [*S1_TOOLS, *build_kb_tools(kb), *await mcp_tools(), *build_custom_tools(kb)]
+
+    @dynamic_prompt
+    def kb_prompt(request: ModelRequest) -> str:
+        """The model sees the CURRENT knowledge base of the calling user on every model call."""
+        return f"{SYSTEM_PROMPT}\n\n{kb.prompt_block(request.runtime.context.user_id)}"
+
+    agent = create_agent(
+        model=model,
+        tools=tools,
+        middleware=[kb_prompt, ShrinkOldToolResults()],
+        context_schema=Ctx,
+        checkpointer=checkpointer,
+    )
     return agent, tools
 
 
@@ -128,3 +147,4 @@ def charts_from(messages: list) -> list[str]:
         for t in messages
         if isinstance(t, ToolMessage) and t.name == "make_chart" and (m := CHART_RE.search(str(t.content)))
     ]
+
