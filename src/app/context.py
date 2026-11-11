@@ -7,4 +7,4 @@ class Ctx:
 
     session_id: str
     user_id: str = ""  # the knowledge base id: one per user, shared by all of that user's chats
-    token: str = ""  # the caller's bearer token; only the MCP interceptor reads it (never a tool argument, prompt or log 
+    token: str = ""  # the caller's bearer token; only the MCP interceptor reads it (never a tool argument, prompt or log line)

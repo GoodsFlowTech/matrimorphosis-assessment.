@@ -14,9 +14,3 @@ async def open_checkpointer():
     Path(CHECKPOINT_DB).resolve().parent.mkdir(parents=True, exist_ok=True)
     async with AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB) as saver:
         yield saver
-
-
-
-@asynccontextmanager
-async def open_checkpointer():
-    yield InMemorySaver()  # TODO(task 3): replace with an AsyncSqliteSaver on CHECKPOINT_DB 

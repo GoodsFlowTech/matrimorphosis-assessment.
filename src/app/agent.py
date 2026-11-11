@@ -147,4 +147,3 @@ def charts_from(messages: list) -> list[str]:
         for t in messages
         if isinstance(t, ToolMessage) and t.name == "make_chart" and (m := CHART_RE.search(str(t.content)))
     ]
-
