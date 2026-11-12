@@ -52,7 +52,7 @@ def build_custom_tools(kb: KnowledgeBase) -> list:
             if not stats["documents"]:
                 return "The knowledge base is empty."
             return (f"{stats['documents']} documents, {stats['sections']} sections, {stats['chunks']} chunks. "
-                    f"Top keywords: {', '.join(stats['keywords'][:top_keywords])}")
+                    f"Top keywords: {', '.join(stats['keywords'][:top_keywords])}.")
         finally:
             KBSTATS_CALLS.add(1, {"status": status})
             log.info("kb_stats_done", tool="kb_stats", status=status, duration_ms=int((time.perf_counter() - t0) * 1000))
